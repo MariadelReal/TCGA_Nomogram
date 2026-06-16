@@ -1,0 +1,308 @@
+## 03_clinical_qc_and_os_construction.R
+## Purpose: build patient-level TCGA-LUAD clinical data for survival modeling.
+## Outputs:
+##   data/clinical_OS.rds
+##   data/clinical_OS.tsv
+##   tables/Clinical_QC_summary.tsv
+##   tables/Clinical_Age_source*.tsv
+##   tables/Clinical_Distribution_*.tsv
+##   figures/ClinicalQC_*.png
+
+rm(list = ls())
+set.seed(123L)
+
+## ---------- Parameters ----------
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+EXCLUDE_OBFUSCATED_AGE <- FALSE
+
+## ---------- Packages ----------
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+})
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+## ---------- Directories ----------
+raw_dir <- file.path(base_dir, "data_raw")
+out_dir <- file.path(base_dir, "data")
+tab_dir <- file.path(base_dir, "tables")
+fig_dir <- file.path(base_dir, "figures")
+log_dir <- file.path(base_dir, "logs")
+
+invisible(lapply(c(out_dir, tab_dir, fig_dir, log_dir), dir.create,
+                 showWarnings = FALSE, recursive = TRUE))
+
+log_file <- file.path(log_dir, "03_clinical_qc.txt")
+cat("# 03_clinical_qc_and_os_construction\n", file = log_file)
+cat(sprintf("Base directory: %s\n", base_dir), file = log_file, append = TRUE)
+
+## ---------- Input ----------
+clin_path <- file.path(raw_dir, "clinical_LUAD.tsv")
+if (!file.exists(clin_path)) stop("Input file not found: ", clin_path)
+clin_raw <- readr::read_tsv(clin_path, show_col_types = FALSE)
+
+## ---------- Helper functions ----------
+col_or_na <- function(df, col, default = NA_character_) {
+  if (col %in% names(df)) return(df[[col]])
+  rep(default, nrow(df))
+}
+
+norm_stage_I_IV <- function(x) {
+  s <- tolower(as.character(x))
+  s <- gsub("^stage\\s+", "", s)
+  s <- gsub("\\s", "", s)
+  s <- toupper(s)
+  s[grepl("^I([AB])?$", s)] <- "I"
+  s[grepl("^II([AB])?$", s)] <- "II"
+  s[grepl("^III([ABC])?$", s)] <- "III"
+  s[grepl("^IV([AB])?$", s)] <- "IV"
+  s[!s %in% c("I", "II", "III", "IV")] <- NA_character_
+  factor(s, levels = c("I", "II", "III", "IV"))
+}
+
+norm_gender <- function(x) {
+  g <- tolower(as.character(x))
+  g[g %in% c("female", "f")] <- "Female"
+  g[g %in% c("male", "m")] <- "Male"
+  g[!g %in% c("Female", "Male")] <- NA_character_
+  factor(g, levels = c("Female", "Male"))
+}
+
+## Smoking status is derived from TCGA clinical text fields and, when present,
+## numeric smoking-history codes (1=current, 2/3=former, 4=never).
+derive_smoking_status <- function(df) {
+  n <- nrow(df)
+  s_txt <- tolower(as.character(col_or_na(df, "tobacco_smoking_status")))
+  cls <- rep(NA_character_, n)
+
+  cls[grepl("^lifelong\\s+non-?smoker$", s_txt)] <- "Never"
+  cls[grepl("^current\\s+smoker$", s_txt)] <- "Current"
+  cls[grepl("^current\\s+reformed\\s+smoker", s_txt)] <- "Former"
+  cls[s_txt %in% c("unknown", "not reported")] <- "Unknown"
+
+  code_cols <- c(
+    "tobacco_smoking_history",
+    "tobacco_smoking_history_indicator",
+    "tobacco_smoking_history_indication",
+    "smoking_history"
+  )
+  code_cols <- intersect(code_cols, names(df))
+  if (length(code_cols)) {
+    code_raw <- suppressWarnings(as.numeric(df[[code_cols[1]]]))
+    need <- is.na(cls) & !is.na(code_raw)
+    cls[need & code_raw == 4] <- "Never"
+    cls[need & code_raw %in% c(2, 3)] <- "Former"
+    cls[need & code_raw == 1] <- "Current"
+  }
+
+  need <- is.na(cls)
+  if (any(need)) {
+    txt_cols <- grep("\\b(smok|tobac|cigar|nicotin)\\b", names(df),
+                     ignore.case = TRUE, value = TRUE)
+    if (length(txt_cols)) {
+      txt <- tolower(apply(as.data.frame(lapply(txt_cols, function(cn) {
+        as.character(df[[cn]])
+      })), 1, function(z) {
+        z <- z[!is.na(z) & z != ""]
+        if (length(z)) paste(z, collapse = " | ") else NA_character_
+      }))
+
+      cls[need & !is.na(txt) & grepl("lifelong|never|non[- ]?smoker|never[- ]?smok", txt)] <- "Never"
+      need <- is.na(cls)
+      cls[need & !is.na(txt) & grepl("former|reformed|ex[- ]?smok|quit|stopp|ceased|previous", txt)] <- "Former"
+      need <- is.na(cls)
+      cls[need & !is.na(txt) & grepl("\\bcurrent\\b|every ?day|daily|now\\s*smok|smokes", txt)] <- "Current"
+    }
+  }
+
+  need <- is.na(cls)
+  if (any(need)) {
+    py  <- suppressWarnings(as.numeric(col_or_na(df, "pack_years_smoked", NA_real_)))
+    yrs <- suppressWarnings(as.numeric(col_or_na(df, "years_smoked", NA_real_)))
+    cpd <- suppressWarnings(as.numeric(col_or_na(df, "cigarettes_per_day", NA_real_)))
+    cls[need & ((!is.na(py) & py == 0) | (!is.na(yrs) & yrs == 0) | (!is.na(cpd) & cpd == 0))] <- "Never"
+    need <- is.na(cls)
+    cls[need & ((!is.na(py) & py > 0) | (!is.na(yrs) & yrs > 0) | (!is.na(cpd) & cpd > 0))] <- "Former"
+  }
+
+  cls[is.na(cls)] <- "Unknown"
+  factor(cls, levels = c("Never", "Former", "Current", "Unknown"))
+}
+
+mk_dist <- function(x, nm) {
+  tb <- as.data.frame(table(x, useNA = "ifany"), stringsAsFactors = FALSE)
+  colnames(tb) <- c(nm, "n")
+  tb[[nm]] <- as.character(tb[[nm]])
+  tb$perc <- round(100 * tb$n / sum(tb$n), 1)
+  tb
+}
+
+plot_counts <- function(df, var, title, fname) {
+  df$.x <- df[[var]]
+  p <- ggplot(df, aes(x = .x)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3, size = 3) +
+    labs(x = var, y = "Count", title = title) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold")) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.12)))
+  ggsave(file.path(fig_dir, fname), p, width = 7, height = 5, dpi = 300)
+}
+
+## ---------- Age construction: diagnosis age, then index age ----------
+age_diag_num  <- suppressWarnings(as.numeric(col_or_na(clin_raw, "age_at_diagnosis", NA_real_)))
+age_index_num <- suppressWarnings(as.numeric(col_or_na(clin_raw, "age_at_index", NA_real_)))
+
+age_diag_years  <- ifelse(!is.na(age_diag_num), age_diag_num / 365.25, NA_real_)
+age_index_years <- ifelse(!is.na(age_index_num), age_index_num, NA_real_)
+
+age_years_vec <- ifelse(!is.na(age_diag_years), age_diag_years, NA_real_)
+use_index <- is.na(age_years_vec) & !is.na(age_index_years)
+age_years_vec[use_index] <- age_index_years[use_index]
+
+age_source_vec <- ifelse(!is.na(age_diag_years), "diagnosis",
+                         ifelse(!is.na(age_index_years), "index", "missing"))
+age_source_vec <- factor(age_source_vec, levels = c("diagnosis", "index", "missing"))
+
+age_obf <- if ("age_is_obfuscated" %in% names(clin_raw)) {
+  tolower(as.character(clin_raw$age_is_obfuscated)) %in% c("true", "1", "yes", "y")
+} else {
+  rep(NA, nrow(clin_raw))
+}
+
+## ---------- Patient-level clinical table ----------
+patient_id_vec <- dplyr::coalesce(
+  as.character(col_or_na(clin_raw, "submitter_id")),
+  as.character(col_or_na(clin_raw, "bcr_patient_barcode"))
+)
+
+stage_source <- dplyr::coalesce(
+  as.character(col_or_na(clin_raw, "ajcc_pathologic_stage")),
+  as.character(col_or_na(clin_raw, "tumor_stage")),
+  as.character(col_or_na(clin_raw, "pathologic_stage")),
+  as.character(col_or_na(clin_raw, "clinical_stage"))
+)
+
+clin0 <- clin_raw %>%
+  mutate(
+    patient_id = patient_id_vec,
+    OS.time = dplyr::coalesce(
+      suppressWarnings(as.numeric(col_or_na(clin_raw, "days_to_death", NA_real_))),
+      suppressWarnings(as.numeric(col_or_na(clin_raw, "days_to_last_follow_up", NA_real_)))
+    ),
+    OS.event = ifelse(tolower(as.character(col_or_na(clin_raw, "vital_status"))) == "dead", 1, 0),
+    age_years = age_years_vec,
+    age_source = age_source_vec,
+    age_is_obfuscated = age_obf,
+    stage_use = norm_stage_I_IV(stage_source),
+    gender = norm_gender(col_or_na(clin_raw, "gender")),
+    smoking_status = derive_smoking_status(clin_raw),
+    smoking_bin = case_when(
+      smoking_status == "Never" ~ "Never",
+      smoking_status %in% c("Former", "Current") ~ "Ever",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Never", "Ever")),
+    ajcc_pathologic_t = col_or_na(clin_raw, "ajcc_pathologic_t"),
+    ajcc_pathologic_n = col_or_na(clin_raw, "ajcc_pathologic_n"),
+    ajcc_pathologic_m = col_or_na(clin_raw, "ajcc_pathologic_m")
+  ) %>%
+  select(patient_id, OS.time, OS.event,
+         age_years, age_source, age_is_obfuscated,
+         gender, stage_use, smoking_status, smoking_bin,
+         ajcc_pathologic_t, ajcc_pathologic_n, ajcc_pathologic_m) %>%
+  distinct()
+
+## Optional exclusion of obfuscated ages.
+n_excl_obf <- 0L
+if (EXCLUDE_OBFUSCATED_AGE && any(!is.na(clin0$age_is_obfuscated))) {
+  n_excl_obf <- sum(clin0$age_is_obfuscated %in% TRUE, na.rm = TRUE)
+  clin0 <- clin0 %>% filter(!(age_is_obfuscated %in% TRUE))
+}
+cat(sprintf("Excluded because age_is_obfuscated == TRUE: %d\n", n_excl_obf),
+    file = log_file, append = TRUE)
+
+## ---------- QC summaries and main outputs ----------
+qc <- tibble(
+  n_rows = nrow(clin0),
+  n_OS_nonmissing = sum(!is.na(clin0$OS.time) & !is.na(clin0$OS.event)),
+  n_age_nonmissing = sum(!is.na(clin0$age_years)),
+  n_age_from_diag = sum(clin0$age_source == "diagnosis", na.rm = TRUE),
+  n_age_from_index = sum(clin0$age_source == "index", na.rm = TRUE),
+  n_gender_nonmissing = sum(!is.na(clin0$gender)),
+  n_stage_nonmissing = sum(!is.na(clin0$stage_use)),
+  n_smok_nonmissing = sum(!is.na(clin0$smoking_status) & clin0$smoking_status != "Unknown"),
+  n_smok_bin_defined = sum(!is.na(clin0$smoking_bin)),
+  n_excluded_obfuscated_age = n_excl_obf
+)
+
+capture.output(qc, file = log_file, append = TRUE)
+readr::write_tsv(qc, file.path(tab_dir, "Clinical_QC_summary.tsv"))
+
+saveRDS(clin0, file.path(out_dir, "clinical_OS.rds"))
+readr::write_tsv(clin0, file.path(out_dir, "clinical_OS.tsv"))
+
+## ---------- Distribution tables ----------
+readr::write_tsv(mk_dist(clin0$gender, "gender"), file.path(tab_dir, "Clinical_Distribution_gender.tsv"))
+readr::write_tsv(mk_dist(clin0$stage_use, "stage"), file.path(tab_dir, "Clinical_Distribution_stage.tsv"))
+readr::write_tsv(mk_dist(clin0$smoking_status, "smoking4"), file.path(tab_dir, "Clinical_Distribution_smoking4.tsv"))
+readr::write_tsv(mk_dist(clin0$smoking_bin, "smoking2"), file.path(tab_dir, "Clinical_Distribution_smoking2.tsv"))
+
+readr::write_tsv(
+  clin0 %>% select(patient_id, age_years, age_source, age_is_obfuscated),
+  file.path(tab_dir, "Clinical_Age_source.tsv")
+)
+readr::write_tsv(
+  tibble(
+    total_rows = nrow(clin0),
+    n_age_from_diag = qc$n_age_from_diag,
+    n_age_from_index = qc$n_age_from_index,
+    n_age_missing = sum(is.na(clin0$age_years)),
+    excl_age_obfuscated = n_excl_obf
+  ),
+  file.path(tab_dir, "Clinical_Age_source_counts.tsv")
+)
+
+## ---------- QC plots ----------
+plot_counts(clin0, "gender", "Gender distribution", "ClinicalQC_counts_gender.png")
+plot_counts(clin0, "stage_use", "Stage distribution (I-IV)", "ClinicalQC_counts_stage.png")
+plot_counts(clin0, "smoking_status", "Smoking distribution", "ClinicalQC_counts_smoking4.png")
+plot_counts(clin0, "smoking_bin", "Smoking distribution: Never/Ever", "ClinicalQC_counts_smoking2.png")
+
+age_vec <- suppressWarnings(as.numeric(clin0$age_years))
+age_clean <- age_vec[!is.na(age_vec)]
+ttl <- sprintf("Age (years) | N=%d (Missing=%d)", length(age_clean), sum(is.na(age_vec)))
+
+p_age_hist <- ggplot(data.frame(age = age_clean), aes(x = age)) +
+  geom_histogram(bins = 30, alpha = 0.85) +
+  geom_density(aes(y = after_stat(density))) +
+  labs(title = ttl, x = "Age (years)", y = "Frequency / density") +
+  theme_bw(base_size = 12)
+ggsave(file.path(fig_dir, "ClinicalQC_age_hist.png"), p_age_hist, width = 7, height = 5, dpi = 300)
+
+p_age_stage <- ggplot(clin0, aes(x = stage_use, y = age_years)) +
+  geom_violin(trim = TRUE, na.rm = TRUE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.8, na.rm = TRUE) +
+  labs(title = "Age by stage", x = "Stage (I-IV)", y = "Age (years)") +
+  theme_bw(base_size = 12)
+ggsave(file.path(fig_dir, "ClinicalQC_age_by_stage.png"), p_age_stage, width = 7, height = 5, dpi = 300)
+
+cat(
+  "\n[OK] Step 03 completed.\n",
+  "- Total patients: ", nrow(clin0), "\n",
+  "- OS defined:     ", qc$n_OS_nonmissing, "\n",
+  "- Age defined:    ", qc$n_age_nonmissing,
+  " (diagnosis=", qc$n_age_from_diag, ", index=", qc$n_age_from_index, ")\n",
+  "- Gender defined: ", qc$n_gender_nonmissing, "\n",
+  "- Stage defined:  ", qc$n_stage_nonmissing, "\n",
+  "- Smoking 4-level:", qc$n_smok_nonmissing, "\n",
+  "- Smoking binary: ", qc$n_smok_bin_defined, "\n",
+  file = log_file,
+  append = TRUE
+)
+
+cat("\n[OK] Clinical OS table and QC outputs created.\n")
+cat("Outputs: data/clinical_OS.*, tables/Clinical_*.tsv, figures/ClinicalQC_*.png\n")
