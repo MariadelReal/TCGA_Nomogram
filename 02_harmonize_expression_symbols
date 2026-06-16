@@ -1,0 +1,170 @@
+## 02_harmonize_expression_symbols.R
+## Purpose: build a gene-by-sample expression matrix using gene symbols.
+## Input:  data_raw/expression_SE_LUAD.rds
+## Output: data/expr_SYMBOL_matrix.rds and data/expr_SYMBOL_matrix.tsv
+## Notes:  The script prefers TPM, then FPKM/FPKM-UQ, and otherwise uses
+##         log2(CPM + 1) from count-like assays.
+
+rm(list = ls())
+set.seed(123L)
+
+## ---------- Project directory ----------
+## Run this script from the project root directory.
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+
+## ---------- Packages ----------
+required_cran <- c("dplyr", "readr", "tibble")
+required_bioc <- c("SummarizedExperiment", "edgeR")
+
+install_if_missing <- function(pkgs, bioc = FALSE) {
+  miss <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (!length(miss)) return(invisible(TRUE))
+
+  if (bioc) {
+    if (!"BiocManager" %in% rownames(installed.packages())) {
+      install.packages("BiocManager", dependencies = TRUE)
+    }
+    BiocManager::install(miss, ask = FALSE, update = FALSE)
+  } else {
+    install.packages(miss, dependencies = TRUE)
+  }
+  invisible(TRUE)
+}
+
+install_if_missing(required_cran, bioc = FALSE)
+install_if_missing(required_bioc, bioc = TRUE)
+
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(readr)
+  library(tibble)
+})
+
+## ---------- Paths ----------
+raw_dir <- file.path(base_dir, "data_raw")
+out_dir <- file.path(base_dir, "data")
+log_dir <- file.path(base_dir, "logs")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(log_dir, showWarnings = FALSE, recursive = TRUE)
+
+log_file <- file.path(log_dir, "02_gene_mapping.txt")
+
+## ---------- Load SummarizedExperiment ----------
+se_path <- file.path(raw_dir, "expression_SE_LUAD.rds")
+if (!file.exists(se_path)) stop("File not found: ", se_path)
+se <- readRDS(se_path)
+
+## ---------- Detect and select expression assay ----------
+assays_avail <- SummarizedExperiment::assayNames(se)
+cat("# Available assays in SummarizedExperiment:\n",
+    paste0("- ", assays_avail, collapse = "\n"), "\n",
+    file = log_file)
+
+select_assay <- function(se_obj, assay_names) {
+  nm <- tolower(assay_names)
+
+  i_tpm <- grep("tpm", nm)
+  if (length(i_tpm)) {
+    return(list(matrix = SummarizedExperiment::assay(se_obj, assay_names[i_tpm[1]]),
+                assay_name = assay_names[i_tpm[1]],
+                metric = "TPM"))
+  }
+
+  i_fpkm <- grep("fpkm", nm)
+  if (length(i_fpkm)) {
+    return(list(matrix = SummarizedExperiment::assay(se_obj, assay_names[i_fpkm[1]]),
+                assay_name = assay_names[i_fpkm[1]],
+                metric = "FPKM"))
+  }
+
+  i_count <- grep("count|unstranded|stranded", nm)
+  if (length(i_count)) {
+    return(list(matrix = SummarizedExperiment::assay(se_obj, assay_names[i_count[1]]),
+                assay_name = assay_names[i_count[1]],
+                metric = "Counts"))
+  }
+
+  list(matrix = SummarizedExperiment::assay(se_obj, assay_names[1]),
+       assay_name = assay_names[1],
+       metric = "unknown")
+}
+
+assay_selected <- select_assay(se, assays_avail)
+mat <- assay_selected$matrix
+metric <- assay_selected$metric
+
+cat(sprintf("\n# Selected assay: %s\n", assay_selected$assay_name),
+    file = log_file, append = TRUE)
+cat(sprintf("# Metric assigned automatically: %s\n", metric),
+    file = log_file, append = TRUE)
+
+## ---------- Transform expression values ----------
+if (metric == "Counts") {
+  suppressPackageStartupMessages(library(edgeR))
+  mat <- as.matrix(mat)
+  mat[mat < 0] <- 0
+  cpm_mat <- edgeR::cpm(mat, log = FALSE)
+  expr_val <- log2(cpm_mat + 1)
+  used_metric <- "log2(CPM+1)"
+} else if (metric %in% c("TPM", "FPKM")) {
+  expr_val <- log2(as.matrix(mat) + 1)
+  used_metric <- paste0("log2(", metric, "+1)")
+} else {
+  suppressPackageStartupMessages(library(edgeR))
+  mat <- as.matrix(mat)
+  mat[mat < 0] <- 0
+  cpm_mat <- edgeR::cpm(mat, log = FALSE)
+  expr_val <- log2(cpm_mat + 1)
+  used_metric <- "log2(CPM+1)_fallback"
+}
+
+cat(sprintf("# Final transformation used: %s\n", used_metric),
+    file = log_file, append = TRUE)
+
+## ---------- Map rows to gene symbols and collapse duplicates ----------
+rd <- as.data.frame(SummarizedExperiment::rowData(se))
+
+sym <- NULL
+if ("gene_name" %in% names(rd)) sym <- rd$gene_name
+if (is.null(sym) && "external_gene_name" %in% names(rd)) sym <- rd$external_gene_name
+if (is.null(sym) && "gene_id" %in% names(rd)) sym <- sub("\\..*$", "", rd$gene_id)
+if (is.null(sym)) sym <- rownames(expr_val)
+
+sym <- as.character(sym)
+sym[!nzchar(sym) | is.na(sym)] <- NA_character_
+
+expr_df <- as.data.frame(expr_val, check.names = FALSE)
+expr_df <- tibble::rownames_to_column(expr_df, "feature_id")
+expr_df$gene <- sym
+
+expr_df <- expr_df %>%
+  dplyr::filter(!is.na(gene)) %>%
+  dplyr::select(gene, dplyr::everything(), -feature_id)
+
+expr_sym <- expr_df %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), mean, na.rm = TRUE),
+                   .groups = "drop")
+
+n_before <- nrow(expr_df)
+n_after  <- nrow(expr_sym)
+n_dups   <- n_before - n_after
+
+cat(sprintf("# Genes before collapse: %s | after collapse: %s | duplicated symbols collapsed: %s\n",
+            n_before, n_after, n_dups),
+    file = log_file, append = TRUE)
+
+## ---------- Export final matrix ----------
+expr_path_rds <- file.path(out_dir, "expr_SYMBOL_matrix.rds")
+expr_path_tsv <- file.path(out_dir, "expr_SYMBOL_matrix.tsv")
+
+saveRDS(expr_sym, expr_path_rds)
+readr::write_tsv(expr_sym, expr_path_tsv)
+
+cat(sprintf("# Exported files:\n- %s\n- %s\n", expr_path_rds, expr_path_tsv),
+    file = log_file, append = TRUE)
+
+cat(paste0("\n[OK] 02_harmonize_expression_symbols completed. Metric: ", used_metric,
+           ". Matrix saved in data/expr_SYMBOL_matrix.*\n"))
