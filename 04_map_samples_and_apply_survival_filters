@@ -1,0 +1,332 @@
+## 04_map_samples_and_apply_survival_filters.R
+## Purpose: map TCGA expression barcodes to patient-level clinical data, keep
+##          primary tumor samples, apply OS filters, deduplicate patients, and
+##          export the survival modeling cohort.
+
+rm(list = ls())
+set.seed(123L)
+
+## ---------- Parameters ----------
+base_dir    <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+min_os_days <- 15
+max_os_days <- 3650   # approximately 10 years
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(SummarizedExperiment)
+  library(stringr)
+  library(ggplot2)
+})
+
+## ---------- Directories ----------
+raw_dir <- file.path(base_dir, "data_raw")
+out_dir <- file.path(base_dir, "data")
+tab_dir <- file.path(base_dir, "tables")
+fig_dir <- file.path(base_dir, "figures")
+log_dir <- file.path(base_dir, "logs")
+
+invisible(lapply(c(out_dir, tab_dir, fig_dir, log_dir), dir.create,
+                 showWarnings = FALSE, recursive = TRUE))
+
+log_file <- file.path(log_dir, "04_filters.txt")
+cat("# 04_map_samples_and_apply_survival_filters\n", file = log_file)
+cat(sprintf("Base directory: %s\n", base_dir), file = log_file, append = TRUE)
+cat(sprintf("OS filters: min=%d days | max=%d days\n\n", min_os_days, max_os_days),
+    file = log_file, append = TRUE)
+
+## ---------- Helpers ----------
+mk_dist <- function(x, nm) {
+  tb <- as.data.frame(table(x, useNA = "ifany"))
+  names(tb) <- c(nm, "n")
+  tb[[nm]] <- as.character(tb[[nm]])
+  tb$perc <- round(100 * tb$n / sum(tb$n), 1)
+  tb
+}
+
+coerce_vec <- function(x) {
+  if (inherits(x, "Rle")) return(as.vector(x))
+  if (is.list(x)) {
+    return(vapply(x, function(z) {
+      if (length(z) == 0) return(NA_character_)
+      if (length(z) == 1) return(as.character(z))
+      paste0(as.character(z), collapse = "|")
+    }, character(1)))
+  }
+  x
+}
+
+plot_counts <- function(df, var, title, fname, order_levels = NULL,
+                        width = 7, height = 5) {
+  df$.x <- df[[var]]
+  if (!is.null(order_levels)) df$.x <- factor(df$.x, levels = order_levels)
+
+  p <- ggplot(df, aes(x = .x)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)),
+              vjust = -0.25, size = 3) +
+    labs(x = var, y = "Count", title = title) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold")) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.12)))
+
+  ggsave(file.path(fig_dir, fname), p, width = width, height = height, dpi = 300)
+}
+
+plot_donut <- function(df, var, title, file_stub, order_levels = NULL,
+                       w = 5, h = 5, dpi = 300) {
+  v <- df[[var]]
+  if (!is.null(order_levels)) {
+    order_levels <- order_levels[!is.na(order_levels)]
+    v <- factor(v, levels = order_levels)
+  }
+
+  tb <- as.data.frame(table(v, useNA = "ifany"), stringsAsFactors = FALSE)
+  names(tb) <- c("cat", "n")
+  tb$cat <- as.character(tb$cat)
+  tb$cat[is.na(tb$cat)] <- "NA"
+  tb <- tb[tb$n > 0, , drop = FALSE]
+  tb$perc <- tb$n / sum(tb$n)
+  tb$lbl  <- sprintf("%s\n%d (%.1f%%)", tb$cat, tb$n, 100 * tb$perc)
+
+  p <- ggplot(tb, aes(x = 2, y = n, fill = cat)) +
+    geom_col(width = 1, color = "white") +
+    coord_polar(theta = "y") +
+    xlim(0.5, 2.5) +
+    theme_void(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold")) +
+    labs(title = title) +
+    geom_text(aes(label = lbl), position = position_stack(vjust = 0.5), size = 3)
+
+  ggsave(file.path(fig_dir, paste0(file_stub, ".png")), p, width = w, height = h, dpi = dpi)
+  ggsave(file.path(fig_dir, paste0(file_stub, ".pdf")), p, width = w, height = h)
+}
+
+## ---------- Inputs from previous steps ----------
+clin_path <- file.path(out_dir, "clinical_OS.rds")
+se_path   <- file.path(raw_dir, "expression_SE_LUAD.rds")
+expr_path <- file.path(out_dir, "expr_SYMBOL_matrix.rds")
+
+if (!file.exists(clin_path)) stop("Missing clinical file: ", clin_path)
+if (!file.exists(se_path))   stop("Missing expression SE file: ", se_path)
+if (!file.exists(expr_path)) stop("Missing expression matrix file: ", expr_path)
+
+clin <- readRDS(clin_path)
+se   <- readRDS(se_path)
+
+## ---------- Sample metadata from SummarizedExperiment ----------
+cd <- as.data.frame(SummarizedExperiment::colData(se))
+if (!"barcode" %in% names(cd)) cd$barcode <- rownames(cd)
+
+cd$barcode <- as.character(cd$barcode)
+cd$short_letter_code <- substr(cd$barcode, 14, 15)
+
+if (!"sample_type" %in% names(cd)) {
+  code_map <- c(
+    "01" = "Primary Tumor",
+    "02" = "Recurrent Tumor",
+    "03" = "Primary Blood-Derived Cancer - Peripheral Blood",
+    "06" = "Metastatic",
+    "11" = "Solid Tissue Normal",
+    "12" = "Blood Derived Normal"
+  )
+  cd$sample_type <- ifelse(cd$short_letter_code %in% names(code_map),
+                           code_map[cd$short_letter_code],
+                           "Unknown")
+}
+cd$patient_id <- substr(cd$barcode, 1, 12)
+
+## ---------- Expression matrix ----------
+expr_df <- readRDS(expr_path)  # first column = gene; remaining columns = barcodes
+stopifnot("gene" %in% names(expr_df))
+barcodes <- setdiff(colnames(expr_df), "gene")
+
+cat(sprintf("Expression samples: %d | Primary Tumor in SE: %d | Normal in SE: %d\n",
+            length(barcodes),
+            sum(cd$short_letter_code == "01", na.rm = TRUE),
+            sum(cd$short_letter_code == "11", na.rm = TRUE)),
+    file = log_file, append = TRUE)
+
+## ---------- Keep primary tumor samples only ----------
+keep_barcodes <- cd %>%
+  filter(short_letter_code == "01") %>%
+  pull(barcode)
+keep_barcodes <- intersect(keep_barcodes, barcodes)
+expr_tumor <- expr_df[, c("gene", keep_barcodes), drop = FALSE]
+
+## ---------- Map expression samples to patient-level clinical data ----------
+map_df <- tibble(
+  barcode    = keep_barcodes,
+  patient_id = substr(keep_barcodes, 1, 12)
+)
+
+clin_map <- map_df %>% left_join(clin, by = "patient_id")
+clin_map <- as.data.frame(lapply(clin_map, coerce_vec),
+                          stringsAsFactors = FALSE,
+                          check.names = FALSE)
+
+clin_map$OS.time  <- suppressWarnings(as.numeric(clin_map$OS.time))
+clin_map$OS.event <- suppressWarnings(as.numeric(clin_map$OS.event))
+
+## ---------- Survival filters ----------
+flow <- tibble(step = character(), n = integer())
+flow <- add_row(flow, step = "S0_Expr_PrimaryTumor_barcodes", n = nrow(clin_map))
+
+clin1 <- subset(clin_map, !is.na(OS.time) & !is.na(OS.event))
+flow  <- add_row(flow, step = "S1_OS_defined", n = nrow(clin1))
+
+clin2 <- subset(clin1, OS.time >= min_os_days)
+flow  <- add_row(flow, step = sprintf("S2_OS_ge_%dd", min_os_days), n = nrow(clin2))
+
+clin3_tmp <- subset(clin2, OS.time <= max_os_days)
+flow <- add_row(flow, step = sprintf("S3_OS_le_%dd", max_os_days), n = nrow(clin3_tmp))
+
+## Deduplicate by patient. If multiple tumor barcodes remain, keep the first barcode
+## alphabetically to make the choice deterministic.
+clin2_df <- as.data.frame(lapply(clin3_tmp, coerce_vec),
+                          stringsAsFactors = FALSE,
+                          check.names = FALSE)
+clin2_df$patient_id <- as.character(clin2_df$patient_id)
+clin2_df$barcode    <- as.character(clin2_df$barcode)
+
+clin2_df <- clin2_df[order(clin2_df$patient_id, clin2_df$barcode, na.last = TRUE), , drop = FALSE]
+clin3 <- clin2_df[!duplicated(clin2_df$patient_id), , drop = FALSE]
+flow <- add_row(flow, step = "S4_unique_patient", n = nrow(clin3))
+
+## ---------- Flow tables and figures ----------
+n_badge <- tibble(
+  item = c("Primary tumor barcodes", "OS defined",
+           sprintf("OS >= %dd", min_os_days),
+           sprintf("OS <= %dd", max_os_days),
+           "Unique patients"),
+  N = flow$n
+)
+
+write_tsv(flow,    file.path(tab_dir, "Flow_04_counts.tsv"))
+write_tsv(n_badge, file.path(tab_dir, "Flow04_badge.tsv"))
+
+p_flow <- ggplot(flow, aes(x = factor(step, levels = step), y = n)) +
+  geom_col() +
+  geom_text(aes(label = n), vjust = -0.3, size = 3) +
+  labs(title = "Filtering flow: step 04", x = "Step", y = "N samples/patients") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 28, hjust = 1))
+ggsave(file.path(fig_dir, "Flow04_bar.png"), p_flow, width = 10, height = 4.8, dpi = 300)
+ggsave(file.path(fig_dir, "Flow04_bar.pdf"), p_flow, width = 10, height = 4.8)
+
+p_badge <- ggplot(n_badge, aes(x = reorder(item, N), y = N, label = N)) +
+  geom_col(width = 0.6) +
+  geom_text(vjust = -0.25, size = 4) +
+  coord_flip() +
+  labs(title = "Key N by filtering step", x = NULL, y = "N") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+ggsave(file.path(fig_dir, "Flow04_badge.png"), p_badge, width = 6, height = 4, dpi = 300)
+
+cat("\nFiltering flow summary:\n", file = log_file, append = TRUE)
+capture.output(flow, file = log_file, append = TRUE)
+
+## ---------- Final survival cohort ----------
+final_barcodes <- clin3$barcode
+expr_tumor_final <- expr_tumor[, c("gene", final_barcodes), drop = FALSE]
+
+clin3$smoking_status <- factor(clin3$smoking_status,
+                               levels = c("Never", "Former", "Current", "Unknown"))
+clin3$smoking_bin <- ifelse(clin3$smoking_status == "Never", "Never",
+                            ifelse(clin3$smoking_status %in% c("Former", "Current"),
+                                   "Ever", NA))
+clin3$smoking_bin <- factor(clin3$smoking_bin, levels = c("Never", "Ever"))
+
+saveRDS(expr_tumor_final, file.path(out_dir, "expr_tumor_SYMBOL_filtered.rds"))
+write_tsv(expr_tumor_final, file.path(out_dir, "expr_tumor_SYMBOL_filtered.tsv"))
+saveRDS(clin3, file.path(out_dir, "clin_survival_cohort.rds"))
+write_tsv(clin3, file.path(out_dir, "clin_survival_cohort.tsv"))
+
+cat("\n[OK] Survival cohort exported with smoking_status and smoking_bin.\n",
+    file = log_file, append = TRUE)
+
+## ---------- Post-filter distributions ----------
+write_tsv(mk_dist(clin3$gender, "gender"),                 file.path(tab_dir, "AfterFilters_Dist_gender.tsv"))
+write_tsv(mk_dist(clin3$stage_use, "stage"),               file.path(tab_dir, "AfterFilters_Dist_stage.tsv"))
+write_tsv(mk_dist(clin3$smoking_status, "smoking_status"), file.path(tab_dir, "AfterFilters_Dist_smoking.tsv"))
+write_tsv(mk_dist(clin3$smoking_bin, "smoking_bin"),       file.path(tab_dir, "AfterFilters_Dist_smokingBIN.tsv"))
+
+plot_counts(clin3, "gender",         "After filters: gender",             "AfterFilters_counts_gender.png",
+            c("Female", "Male"))
+plot_counts(clin3, "stage_use",      "After filters: stage (I-IV)",       "AfterFilters_counts_stage.png",
+            c("I", "II", "III", "IV"))
+plot_counts(clin3, "smoking_status", "After filters: smoking status",     "AfterFilters_counts_smoking.png",
+            c("Never", "Former", "Current", "Unknown"), width = 8)
+plot_counts(clin3, "smoking_bin",    "After filters: smoking bin",        "AfterFilters_counts_smokingBIN.png",
+            c("Never", "Ever"), width = 6)
+
+p_os_hist <- ggplot(clin3, aes(x = as.numeric(OS.time) / 365.25)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Follow-up time distribution", x = "Years", y = "Count") +
+  theme_bw(base_size = 12)
+ggsave(file.path(fig_dir, "AfterFilters_OS_hist_years.png"), p_os_hist,
+       width = 7, height = 5, dpi = 300)
+
+## ---------- Complete-case datasets ----------
+## A) age + gender + stage
+clin_cc <- clin3 %>%
+  mutate(age_years = as.numeric(age_years),
+         gender    = as.factor(gender),
+         stage_use = as.factor(stage_use)) %>%
+  filter(!is.na(age_years), !is.na(gender), !is.na(stage_use))
+expr_cc <- expr_tumor_final[, c("gene", clin_cc$barcode), drop = FALSE]
+
+saveRDS(clin_cc, file.path(out_dir, "clin_complete_case.rds"))
+write_tsv(clin_cc, file.path(out_dir, "clin_complete_case.tsv"))
+saveRDS(expr_cc, file.path(out_dir, "expr_tumor_SYMBOL_complete_case.rds"))
+write_tsv(expr_cc, file.path(out_dir, "expr_tumor_SYMBOL_complete_case.tsv"))
+cat(sprintf("\nComplete case (age + gender + stage): n=%d\n", nrow(clin_cc)),
+    file = log_file, append = TRUE)
+
+## B) age + gender + stage + smoking, excluding Unknown smoking status
+clin_cc_sm <- clin3 %>%
+  mutate(age_years = as.numeric(age_years),
+         gender    = as.factor(gender),
+         stage_use = as.factor(stage_use),
+         smoking_status = as.factor(smoking_status),
+         smoking_bin    = as.factor(smoking_bin)) %>%
+  filter(!is.na(age_years), !is.na(gender), !is.na(stage_use),
+         !is.na(smoking_status), smoking_status != "Unknown")
+expr_cc_sm <- expr_tumor_final[, c("gene", clin_cc_sm$barcode), drop = FALSE]
+
+saveRDS(clin_cc_sm, file.path(out_dir, "clin_complete_case_w_smoking.rds"))
+write_tsv(clin_cc_sm, file.path(out_dir, "clin_complete_case_w_smoking.tsv"))
+saveRDS(expr_cc_sm, file.path(out_dir, "expr_tumor_SYMBOL_complete_case_w_smoking.rds"))
+write_tsv(expr_cc_sm, file.path(out_dir, "expr_tumor_SYMBOL_complete_case_w_smoking.tsv"))
+cat(sprintf("Complete case + smoking: n=%d (Unknown excluded)\n", nrow(clin_cc_sm)),
+    file = log_file, append = TRUE)
+
+## ---------- Donut plots for final cohort composition ----------
+plot_donut(clin3, "gender",
+           "Final cohort: gender",
+           "AfterFilters_donut_gender",
+           order_levels = c("Female", "Male"))
+
+plot_donut(clin3, "stage_use",
+           "Final cohort: stage (I-IV)",
+           "AfterFilters_donut_stage",
+           order_levels = c("I", "II", "III", "IV"))
+
+plot_donut(clin3, "smoking_status",
+           "Final cohort: smoking status",
+           "AfterFilters_donut_smoking",
+           order_levels = c("Never", "Former", "Current", "Unknown"),
+           w = 5.5, h = 5.5)
+
+plot_donut(clin3, "smoking_bin",
+           "Final cohort: smoking bin",
+           "AfterFilters_donut_smokingBIN",
+           order_levels = c("Never", "Ever"),
+           w = 5, h = 5)
+
+cat("\n[OK] 04_map_samples_and_apply_survival_filters completed.\n",
+    file = log_file, append = TRUE)
+
+message("[OK] 04_map_samples_and_apply_survival_filters completed. Outputs written to data/, tables/, figures/, and logs/.")
