@@ -1,0 +1,241 @@
+## 10_sanity_checks.R
+## Purpose: run final sanity checks for the TCGA-LUAD survival/signature workflow.
+## Checks:
+##   1) survival cohort integrity
+##   2) expression-clinical alignment
+##   3) univariable Cox sanity for canonical cell-cycle genes
+##   4) median split vs optional maxstat cutpoint KM comparison
+##   5) minimal LASSO fit stability checks
+
+rm(list = ls())
+set.seed(123L)
+
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+
+suppressPackageStartupMessages({
+  library(survival)
+  library(readr)
+  library(tibble)
+  library(dplyr)
+})
+
+# Optional packages used only if available
+has_survminer <- requireNamespace("survminer", quietly = TRUE)
+has_glmnet    <- requireNamespace("glmnet", quietly = TRUE)
+has_matrix    <- requireNamespace("Matrix", quietly = TRUE)
+
+data_dir <- file.path(base_dir, "data")
+tab_dir  <- file.path(base_dir, "tables");  dir.create(tab_dir,  showWarnings = FALSE, recursive = TRUE)
+log_dir  <- file.path(base_dir, "logs");    dir.create(log_dir,  showWarnings = FALSE, recursive = TRUE)
+fig_dir  <- file.path(base_dir, "figures"); dir.create(fig_dir,  showWarnings = FALSE, recursive = TRUE)
+
+log_file <- file.path(log_dir, "10_sanity_checks.txt")
+cat("# 10_sanity_checks\n", file = log_file)
+cat(sprintf("Base directory: %s\n\n", base_dir), file = log_file, append = TRUE)
+
+norm_bar <- function(x) toupper(gsub("[.]", "-", as.character(x)))
+
+log_msg <- function(...) {
+  msg <- paste0(...)
+  message(msg)
+  cat(msg, "\n", file = log_file, append = TRUE)
+}
+
+# -------------------------------------------------------------------------
+# 1) Cohort integrity
+# -------------------------------------------------------------------------
+clin_path <- file.path(data_dir, "clin_survival_cohort.rds")
+if (!file.exists(clin_path)) stop("Missing clinical cohort file: ", clin_path)
+clin <- readRDS(clin_path)
+
+required_clin <- c("barcode", "OS.time", "OS.event", "age_years", "gender", "stage_use")
+missing_clin <- setdiff(required_clin, names(clin))
+if (length(missing_clin)) stop("Clinical object is missing columns: ", paste(missing_clin, collapse = ", "))
+
+clin$barcode  <- norm_bar(clin$barcode)
+clin$OS.time  <- suppressWarnings(as.numeric(clin$OS.time))
+clin$OS.event <- suppressWarnings(as.numeric(clin$OS.event))
+
+n_events <- sum(clin$OS.event == 1, na.rm = TRUE)
+if (n_events <= 150) warning("Event count is <=150. Check cohort construction: events=", n_events)
+if (any(clin$OS.time < 0, na.rm = TRUE)) stop("Negative OS.time values detected.")
+
+cohort_summary <- tibble(
+  item = c("patients", "events", "OS_nonmissing", "age_nonmissing", "gender_nonmissing", "stage_nonmissing"),
+  n = c(
+    nrow(clin),
+    n_events,
+    sum(!is.na(clin$OS.time) & !is.na(clin$OS.event)),
+    sum(!is.na(clin$age_years)),
+    sum(!is.na(clin$gender)),
+    sum(!is.na(clin$stage_use))
+  )
+)
+readr::write_tsv(cohort_summary, file.path(tab_dir, "Sanity_cohort_summary.tsv"))
+
+os_summary <- tibble(
+  min = min(clin$OS.time, na.rm = TRUE),
+  q1 = as.numeric(quantile(clin$OS.time, 0.25, na.rm = TRUE)),
+  median = median(clin$OS.time, na.rm = TRUE),
+  mean = mean(clin$OS.time, na.rm = TRUE),
+  q3 = as.numeric(quantile(clin$OS.time, 0.75, na.rm = TRUE)),
+  max = max(clin$OS.time, na.rm = TRUE)
+)
+readr::write_tsv(os_summary, file.path(tab_dir, "Sanity_OS_time_summary.tsv"))
+log_msg("[OK] Cohort integrity checked. Patients=", nrow(clin), " | events=", n_events)
+
+# -------------------------------------------------------------------------
+# 2) Expression-clinical alignment
+# -------------------------------------------------------------------------
+# Preferred object from 05_build_design_matrices.R: rows=barcodes, columns=genes.
+X_path <- file.path(data_dir, "X_genes_signature_scaled.rds")
+if (!file.exists(X_path)) stop("Missing scaled signature matrix: ", X_path)
+X <- readRDS(X_path)
+
+if (is.data.frame(X) && "gene" %in% names(X)) {
+  # Backward-compatible layout: first column gene, remaining columns barcodes.
+  genes <- X$gene
+  E <- as.matrix(X[, setdiff(names(X), "gene"), drop = FALSE])
+  rownames(E) <- genes
+  X_mat <- t(E)
+} else {
+  X_mat <- as.matrix(X)
+}
+
+rownames(X_mat) <- norm_bar(rownames(X_mat))
+common_ids <- intersect(rownames(X_mat), clin$barcode)
+if (length(common_ids) <= 400) warning("Common expression-clinical samples <=400: n=", length(common_ids))
+if (!length(common_ids)) stop("No overlap between expression matrix rownames and clinical barcodes.")
+
+clin_aligned <- clin[match(common_ids, clin$barcode), , drop = FALSE]
+X_aligned <- X_mat[common_ids, , drop = FALSE]
+stopifnot(all(rownames(X_aligned) == clin_aligned$barcode))
+
+alignment_summary <- tibble(
+  item = c("expression_samples", "clinical_patients", "matched_samples", "signature_genes"),
+  n = c(nrow(X_mat), nrow(clin), nrow(X_aligned), ncol(X_aligned))
+)
+readr::write_tsv(alignment_summary, file.path(tab_dir, "Sanity_alignment_summary.tsv"))
+log_msg("[OK] Expression-clinical alignment checked. Matched n=", nrow(X_aligned))
+
+# -------------------------------------------------------------------------
+# 3) Univariable Cox sanity for canonical genes
+# -------------------------------------------------------------------------
+canonical_genes <- c("BIRC5", "CCNB1", "FOXM1")
+present_genes <- intersect(canonical_genes, colnames(X_aligned))
+
+cox_rows <- list()
+if (length(present_genes)) {
+  y <- with(clin_aligned, Surv(OS.time, OS.event))
+  for (g in present_genes) {
+    x <- as.numeric(X_aligned[, g])
+    keep <- is.finite(x) & is.finite(clin_aligned$OS.time) & is.finite(clin_aligned$OS.event)
+    fit <- survival::coxph(y[keep] ~ x[keep], ties = "efron")
+    s <- summary(fit)
+    ph <- tryCatch(survival::cox.zph(fit), error = function(e) NULL)
+    ph_p <- if (!is.null(ph)) as.numeric(ph$table[1, "p"]) else NA_real_
+    ci <- exp(confint(fit))
+    cox_rows[[g]] <- tibble(
+      gene = g,
+      n = sum(keep),
+      events = sum(clin_aligned$OS.event[keep] == 1, na.rm = TRUE),
+      beta = as.numeric(coef(fit)),
+      HR = as.numeric(exp(coef(fit))),
+      CI95L = as.numeric(ci[1]),
+      CI95U = as.numeric(ci[2]),
+      p_effect = as.numeric(s$coef[1, "Pr(>|z|)"]),
+      p_PH = ph_p
+    )
+  }
+  cox_df <- bind_rows(cox_rows)
+  readr::write_tsv(cox_df, file.path(tab_dir, "Sanity_univariable_canonical_genes.tsv"))
+  log_msg("[OK] Univariable Cox sanity checked for: ", paste(present_genes, collapse = ", "))
+} else {
+  log_msg("[SKIP] None of the canonical genes were present in the signature matrix: ", paste(canonical_genes, collapse = ", "))
+}
+
+# -------------------------------------------------------------------------
+# 4) KM: median split vs optional maxstat cutpoint for one canonical gene
+# -------------------------------------------------------------------------
+km_gene <- if ("BIRC5" %in% present_genes) "BIRC5" else if (length(present_genes)) present_genes[1] else NA_character_
+if (!is.na(km_gene)) {
+  df <- tibble(
+    time = as.numeric(clin_aligned$OS.time),
+    event = as.numeric(clin_aligned$OS.event),
+    x = as.numeric(X_aligned[, km_gene])
+  ) %>%
+    filter(is.finite(time), is.finite(event), is.finite(x))
+
+  df$median_group <- ifelse(df$x >= median(df$x, na.rm = TRUE), "High", "Low")
+  df$median_group <- factor(df$median_group, levels = c("Low", "High"))
+  fit_med <- survival::survfit(Surv(time, event) ~ median_group, data = df)
+  cox_med <- survival::coxph(Surv(time, event) ~ median_group, data = df)
+  med_ci <- exp(confint(cox_med))
+  km_summary <- tibble(
+    gene = km_gene,
+    cut_method = "median",
+    n = nrow(df),
+    events = sum(df$event == 1, na.rm = TRUE),
+    HR_high_vs_low = as.numeric(exp(coef(cox_med))),
+    CI95L = as.numeric(med_ci[1]),
+    CI95U = as.numeric(med_ci[2]),
+    p_effect = as.numeric(summary(cox_med)$coef[1, "Pr(>|z|)"])
+  )
+
+  if (has_survminer) {
+    cp <- survminer::surv_cutpoint(df, time = "time", event = "event", variables = "x", minprop = 0.2)
+    df_cat <- survminer::surv_categorize(cp)
+    fit_best <- survival::survfit(Surv(time, event) ~ x, data = df_cat)
+    cox_best <- survival::coxph(Surv(time, event) ~ x, data = df_cat)
+    best_ci <- exp(confint(cox_best))
+    km_summary <- bind_rows(km_summary, tibble(
+      gene = km_gene,
+      cut_method = "surv_cutpoint_minprop_0.2",
+      n = nrow(df_cat),
+      events = sum(df_cat$event == 1, na.rm = TRUE),
+      HR_high_vs_low = as.numeric(exp(coef(cox_best))),
+      CI95L = as.numeric(best_ci[1]),
+      CI95U = as.numeric(best_ci[2]),
+      p_effect = as.numeric(summary(cox_best)$coef[1, "Pr(>|z|)"])
+    ))
+  } else {
+    log_msg("[SKIP] Package 'survminer' not installed; best-cut KM check omitted.")
+  }
+  readr::write_tsv(km_summary, file.path(tab_dir, "Sanity_KM_cutpoint_comparison.tsv"))
+  log_msg("[OK] KM cutpoint sanity checked for ", km_gene)
+}
+
+# -------------------------------------------------------------------------
+# 5) LASSO fit stability
+# -------------------------------------------------------------------------
+cv_paths <- c(
+  file.path(data_dir, "lasso_signatureONLY_cv_fit.rds"),
+  file.path(data_dir, "lasso_cv_fit.rds")
+)
+cv_path <- cv_paths[file.exists(cv_paths)][1]
+
+if (!is.na(cv_path) && has_glmnet) {
+  cv <- readRDS(cv_path)
+  if (!is.finite(cv$lambda.min) || cv$lambda.min <= 0) stop("Invalid lambda.min in LASSO cv object.")
+  if (!is.null(cv$lambda.1se) && (!is.finite(cv$lambda.1se) || cv$lambda.1se <= 0)) {
+    warning("Invalid lambda.1se in LASSO cv object.")
+  }
+  nnz <- function(s) {
+    cf <- coef(cv, s = s)
+    if (has_matrix) Matrix::nnzero(cf) else sum(as.numeric(cf) != 0)
+  }
+  lasso_summary <- tibble(
+    cv_file = basename(cv_path),
+    lambda_min = cv$lambda.min,
+    lambda_1se = if (!is.null(cv$lambda.1se)) cv$lambda.1se else NA_real_,
+    nonzero_lambda_min = nnz("lambda.min"),
+    nonzero_lambda_1se = if (!is.null(cv$lambda.1se)) nnz("lambda.1se") else NA_integer_
+  )
+  readr::write_tsv(lasso_summary, file.path(tab_dir, "Sanity_LASSO_stability.tsv"))
+  log_msg("[OK] LASSO sanity checked using ", basename(cv_path))
+} else {
+  reason <- if (!has_glmnet) "package 'glmnet' not installed" else "no saved LASSO cv object found"
+  log_msg("[SKIP] LASSO stability check omitted: ", reason, ".")
+}
+
+log_msg("[DONE] Sanity checks completed.")
