@@ -1,0 +1,289 @@
+## 08_nomogram_clinic_signature_robust.R
+## Purpose: build a robust Cox nomogram integrating a gene-signature linear predictor
+##          and available clinical covariates for TCGA-LUAD overall survival.
+## Inputs:
+##   data/clinical_for_modeling.rds
+##   tables/LASSO_signatureONLY_LP.tsv   (preferred LP source)
+##   tables/EN_nonneg_signature_LP.tsv   (optional fallback)
+##   tables/PC1_signature_LP.tsv         (optional fallback)
+## Outputs:
+##   figures/FIG_nomogram_signature_clinic_NO_NEG.png
+##   figures/FIG_nomogram_calibration_5y_NO_NEG.png
+##   tables/Nomogram_Cindex_NO_NEG.tsv
+##   models/nomogram_signature_clinic_robust.rds
+
+rm(list = ls())
+set.seed(2025L)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(survival)
+  library(rms)
+})
+
+## ---------- Project paths ----------
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+data_dir <- file.path(base_dir, "data")
+tab_dir  <- file.path(base_dir, "tables")
+fig_dir  <- file.path(base_dir, "figures")
+mod_dir  <- file.path(base_dir, "models")
+log_dir  <- file.path(base_dir, "logs")
+
+invisible(lapply(c(tab_dir, fig_dir, mod_dir, log_dir), dir.create,
+                 recursive = TRUE, showWarnings = FALSE))
+
+log_file <- file.path(log_dir, "08_nomogram_clinic_signature_robust.txt")
+cat("# 08_nomogram_clinic_signature_robust\n", file = log_file)
+
+## ---------- Parameters ----------
+CALIBRATION_TIME_DAYS <- 1825L  # 5 years
+CALIBRATION_GROUP_N   <- 80L
+CALIBRATION_BOOT_B    <- 200L
+
+## ---------- Utilities ----------
+norm_bar <- function(x) {
+  toupper(gsub("[.]", "-", as.character(x)))
+}
+
+valid_factor <- function(f) {
+  is.factor(f) && nlevels(droplevels(f)) >= 2L
+}
+
+read_lp_file <- function(path, preferred_names = character()) {
+  tmp <- readr::read_tsv(path, show_col_types = FALSE)
+  if (!"sample_id" %in% names(tmp)) stop("LP file has no sample_id column: ", path)
+
+  candidate <- intersect(names(tmp), preferred_names)
+  if (!length(candidate)) {
+    candidate <- setdiff(names(tmp), c("sample_id", "OS.time", "OS.event"))
+  }
+  if (length(candidate) != 1L) {
+    stop("Could not identify a unique LP column in: ", path)
+  }
+
+  tmp %>%
+    transmute(
+      sample_id = norm_bar(sample_id),
+      LP_raw    = as.numeric(.data[[candidate]])
+    )
+}
+
+fit_cph_with_warnings <- function(formula, data, time_inc) {
+  warn <- character()
+  fit <- withCallingHandlers(
+    tryCatch(
+      rms::cph(formula, data = data, x = TRUE, y = TRUE, surv = TRUE, time.inc = time_inc),
+      error = function(e) e
+    ),
+    warning = function(w) {
+      warn <<- c(warn, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = warn)
+}
+
+## ---------- Load clinical data ----------
+clin_path <- file.path(data_dir, "clinical_for_modeling.rds")
+if (!file.exists(clin_path)) stop("Missing clinical data: ", clin_path)
+
+clin_m <- readRDS(clin_path)
+required_cols <- c("OS.time", "OS.event", "barcode", "age_years", "gender",
+                   "stage_use", "smoking_status")
+stopifnot(all(required_cols %in% names(clin_m)))
+
+## ---------- Load linear predictor ----------
+## Priority follows the original analysis: LASSO -> non-negative elastic net -> PC1.
+lp_sources <- list(
+  LASSO_signatureONLY = list(
+    path = file.path(tab_dir, "LASSO_signatureONLY_LP.tsv"),
+    preferred = character()
+  ),
+  EN_nonneg_signature = list(
+    path = file.path(tab_dir, "EN_nonneg_signature_LP.tsv"),
+    preferred = c("LP_EN_nonneg", "LP", "lp")
+  ),
+  PC1_signature = list(
+    path = file.path(tab_dir, "PC1_signature_LP.tsv"),
+    preferred = c("LP_PC1_meta", "LP", "lp")
+  )
+)
+
+lp <- NULL
+lp_source_name <- NA_character_
+for (nm in names(lp_sources)) {
+  source <- lp_sources[[nm]]
+  if (file.exists(source$path)) {
+    lp <- read_lp_file(source$path, preferred_names = source$preferred)
+    lp_source_name <- nm
+    message("[LP] Using ", basename(source$path))
+    cat("LP source: ", basename(source$path), "\n", file = log_file, append = TRUE, sep = "")
+    break
+  }
+}
+if (is.null(lp)) {
+  stop("No saved LP file was found. Run the LASSO or PC1 script first.")
+}
+
+## ---------- Merge and clean modeling data ----------
+clin_nom <- clin_m %>%
+  mutate(
+    barcode  = norm_bar(barcode),
+    OS.time  = as.numeric(OS.time),
+    OS.event = as.numeric(OS.event),
+    age      = as.numeric(age_years),
+    gender   = factor(gender, levels = c("Female", "Male")),
+    stage    = factor(stage_use, levels = c("I", "II", "III", "IV")),
+    smoking  = factor(smoking_status, levels = c("Never", "Former", "Current", "Unknown"))
+  ) %>%
+  left_join(lp, by = c("barcode" = "sample_id")) %>%
+  filter(is.finite(OS.time), is.finite(OS.event), is.finite(LP_raw))
+
+if (nrow(clin_nom) == 0L) stop("No samples remained after merging clinical data and LP.")
+
+## ---------- Orient LP so that higher values correspond to higher risk ----------
+y_uni <- survival::Surv(clin_nom$OS.time, clin_nom$OS.event)
+b_uni <- as.numeric(stats::coef(survival::coxph(y_uni ~ LP_raw, data = clin_nom)))
+sgn   <- ifelse(is.finite(b_uni) && b_uni < 0, -1, 1)
+
+clin_nom$LP_pos <- sgn * clin_nom$LP_raw
+clin_nom$LP_pos <- clin_nom$LP_pos - min(clin_nom$LP_pos, na.rm = TRUE)
+
+cat(sprintf("N=%d | LP source=%s | LP univariable beta=%.6f | sign=%s\n",
+            nrow(clin_nom), lp_source_name, b_uni, sgn),
+    file = log_file, append = TRUE)
+
+## ---------- Choose usable covariates ----------
+clin_nom <- within(clin_nom, {
+  gender  <- droplevels(gender)
+  stage   <- droplevels(stage)
+  smoking <- droplevels(smoking)
+})
+
+rhs <- c(
+  "LP_pos",
+  if (valid_factor(clin_nom$gender)) "gender" else NULL,
+  if (valid_factor(clin_nom$stage)) "stage" else NULL,
+  if (valid_factor(clin_nom$smoking)) "smoking" else NULL,
+  if (is.finite(stats::sd(clin_nom$age, na.rm = TRUE)) && stats::sd(clin_nom$age, na.rm = TRUE) > 0) "age" else NULL
+)
+rhs <- unique(rhs)
+stopifnot("LP_pos" %in% rhs)
+
+## ---------- Fit Cox model using rms::cph, with fallback if the design is singular ----------
+dd <- rms::datadist(clin_nom)
+options(datadist = "dd")
+
+form_full <- as.formula(paste(
+  "Surv(OS.time, OS.event) ~",
+  paste(rhs, collapse = " + ")
+))
+
+fit_attempt <- fit_cph_with_warnings(form_full, clin_nom, time_inc = CALIBRATION_TIME_DAYS)
+needs_fallback <- inherits(fit_attempt$fit, "error") ||
+  any(grepl("singular", fit_attempt$warnings, ignore.case = TRUE))
+
+if (needs_fallback) {
+  msg <- if (inherits(fit_attempt$fit, "error")) conditionMessage(fit_attempt$fit) else paste(fit_attempt$warnings, collapse = " | ")
+  cat("Full model warning/error; using fallback LP_pos + age when available.\n",
+      msg, "\n", file = log_file, append = TRUE)
+
+  rhs2 <- intersect(rhs, c("LP_pos", "age"))
+  if (!length(rhs2)) rhs2 <- "LP_pos"
+
+  form_fit <- as.formula(paste(
+    "Surv(OS.time, OS.event) ~",
+    paste(rhs2, collapse = " + ")
+  ))
+  fit_attempt <- fit_cph_with_warnings(form_fit, clin_nom, time_inc = CALIBRATION_TIME_DAYS)
+} else {
+  form_fit <- form_full
+}
+
+fit_nom <- fit_attempt$fit
+if (!inherits(fit_nom, "cph")) stop("Could not fit the cph nomogram model.")
+
+cat("Final formula: ", deparse(form_fit), "\n", file = log_file, append = TRUE, sep = "")
+if (length(fit_attempt$warnings)) {
+  cat("Warnings:\n", paste0("- ", fit_attempt$warnings, collapse = "\n"), "\n",
+      file = log_file, append = TRUE)
+}
+
+## ---------- Nomogram ----------
+surv_fun <- rms::Survival(fit_nom)
+nom <- rms::nomogram(
+  fit_nom,
+  fun = list(
+    function(lp) surv_fun(365,  lp),
+    function(lp) surv_fun(1095, lp),
+    function(lp) surv_fun(1825, lp)
+  ),
+  funlabel = c("1-year survival", "3-year survival", "5-year survival"),
+  lp = FALSE,
+  maxscale = 100
+)
+
+try({
+  for (i in seq_along(nom)) {
+    if (!is.null(nom[[i]]$name) && nom[[i]]$name == "LP_pos") {
+      nom[[i]]$name <- "Signature score (LP >= 0)"
+    }
+  }
+}, silent = TRUE)
+
+png(file.path(fig_dir, "FIG_nomogram_signature_clinic_NO_NEG.png"),
+    width = 10, height = 7, units = "in", res = 300)
+plot(nom, xfrac = 0.35, lmgp = 0.2)
+dev.off()
+
+## ---------- 5-year calibration ----------
+cal <- rms::calibrate(
+  fit_nom,
+  cmethod = "KM",
+  method  = "boot",
+  u       = CALIBRATION_TIME_DAYS,
+  m       = CALIBRATION_GROUP_N,
+  B       = CALIBRATION_BOOT_B
+)
+
+png(file.path(fig_dir, "FIG_nomogram_calibration_5y_NO_NEG.png"),
+    width = 7, height = 6, units = "in", res = 300)
+plot(cal,
+     xlab = "Predicted 5-year survival probability",
+     ylab = sprintf("Observed survival probability (bootstrap %sx)", CALIBRATION_BOOT_B))
+dev.off()
+
+## ---------- C-index ----------
+linear_predictor <- as.numeric(stats::predict(fit_nom, type = "lp"))
+cidx <- survival::concordance(
+  survival::Surv(clin_nom$OS.time, clin_nom$OS.event) ~ linear_predictor
+)$concordance
+
+readr::write_tsv(
+  tibble(
+    Model = "Nomogram_signature_plus_clinic_LP_nonnegative",
+    LP_source = lp_source_name,
+    Formula = deparse(form_fit),
+    N = nrow(clin_nom),
+    C_index = cidx
+  ),
+  file.path(tab_dir, "Nomogram_Cindex_NO_NEG.tsv")
+)
+
+saveRDS(
+  list(
+    fit = fit_nom,
+    nomogram = nom,
+    calibration_5y = cal,
+    data = clin_nom,
+    formula = form_fit,
+    c_index = cidx,
+    lp_source = lp_source_name
+  ),
+  file.path(mod_dir, "nomogram_signature_clinic_robust.rds")
+)
+
+message(sprintf("Nomogram complete. C-index = %.3f", cidx))
+message("Figures saved in: ", fig_dir)
