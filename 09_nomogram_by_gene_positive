@@ -1,0 +1,295 @@
+## 09_nomogram_by_gene_positive.R
+## Purpose: build a Cox nomogram using selected signature genes oriented so that
+##          higher values correspond to higher univariable hazard.
+## Inputs:
+##   data/expr_tumor_SYMBOL_filtered.rds
+##   data/clin_survival_cohort.rds
+##   sig/CellCycle_LUAD_v1.csv
+## Outputs:
+##   figures/FIG_nomogram_byGENE_POS.png
+##   tables/Gene_signs_orientation.tsv
+##   tables/Nomogram_byGENE_POS_Cindex.tsv
+##   models/nomogram_by_gene_positive.rds
+
+rm(list = ls())
+set.seed(2025L)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(survival)
+  library(rms)
+})
+
+## ---------- Project paths ----------
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+data_dir <- file.path(base_dir, "data")
+sig_dir  <- file.path(base_dir, "sig")
+tab_dir  <- file.path(base_dir, "tables")
+fig_dir  <- file.path(base_dir, "figures")
+mod_dir  <- file.path(base_dir, "models")
+log_dir  <- file.path(base_dir, "logs")
+
+invisible(lapply(c(tab_dir, fig_dir, mod_dir, log_dir), dir.create,
+                 recursive = TRUE, showWarnings = FALSE))
+
+log_file <- file.path(log_dir, "09_nomogram_by_gene_positive.txt")
+cat("# 09_nomogram_by_gene_positive\n", file = log_file)
+
+## ---------- Parameters ----------
+TOP_K_GENES <- 12L
+NOMOGRAM_TIMES_DAYS <- c(`1 year` = 365, `3 years` = 1095, `5 years` = 1825)
+
+## ---------- Utilities ----------
+norm_bar <- function(x) {
+  toupper(gsub("[.]", "-", as.character(x)))
+}
+
+coerce_vec <- function(x) {
+  if (inherits(x, "Rle")) return(as.vector(x))
+  if (is.list(x)) {
+    return(vapply(x, function(z) {
+      if (length(z) == 0) return(NA_character_)
+      if (length(z) == 1) return(as.character(z))
+      paste(as.character(z), collapse = "|")
+    }, character(1)))
+  }
+  x
+}
+
+safe_gene_name <- function(x) make.names(x, unique = TRUE)
+
+## ---------- Load expression, clinical data, and signature ----------
+expr_path <- file.path(data_dir, "expr_tumor_SYMBOL_filtered.rds")
+clin_path <- file.path(data_dir, "clin_survival_cohort.rds")
+sig_file  <- file.path(sig_dir, "CellCycle_LUAD_v1.csv")
+
+if (!file.exists(expr_path)) stop("Missing expression matrix: ", expr_path)
+if (!file.exists(clin_path)) stop("Missing clinical cohort: ", clin_path)
+if (!file.exists(sig_file))  stop("Missing signature file: ", sig_file)
+
+expr <- readRDS(expr_path)  # first column: gene; remaining columns: barcodes
+clin <- readRDS(clin_path)
+
+stopifnot("gene" %in% names(expr))
+stopifnot(all(c("OS.time", "OS.event", "barcode") %in% names(clin)))
+
+sig <- readr::read_csv(sig_file, show_col_types = FALSE)
+colnames(sig) <- tolower(colnames(sig))
+stopifnot("gene_symbol" %in% names(sig))
+genes_signature <- unique(toupper(sig$gene_symbol))
+
+cat(sprintf("Signature genes provided: %d\n", length(genes_signature)),
+    file = log_file, append = TRUE)
+
+## ---------- Align expression and clinical data ----------
+expr$gene <- toupper(expr$gene)
+expr_barcodes <- setdiff(colnames(expr), "gene")
+colnames(expr)[match(expr_barcodes, colnames(expr))] <- norm_bar(expr_barcodes)
+
+clin <- as.data.frame(lapply(clin, coerce_vec), stringsAsFactors = FALSE)
+clin$barcode <- norm_bar(clin$barcode)
+
+present_genes <- intersect(genes_signature, expr$gene)
+missing_genes <- setdiff(genes_signature, present_genes)
+
+cat(sprintf("Signature genes present in expression: %d | missing: %d\n",
+            length(present_genes), length(missing_genes)),
+    file = log_file, append = TRUE)
+
+if (length(missing_genes)) {
+  writeLines(missing_genes, con = file.path(tab_dir, "Nomogram_byGENE_missing_signature_genes.txt"))
+}
+if (!length(present_genes)) stop("No signature genes were found in the expression matrix.")
+
+expr_barcodes <- setdiff(colnames(expr), "gene")
+Xg_raw <- t(as.matrix(expr[match(present_genes, expr$gene), expr_barcodes, drop = FALSE]))
+colnames(Xg_raw) <- present_genes
+rownames(Xg_raw) <- norm_bar(rownames(Xg_raw))
+storage.mode(Xg_raw) <- "double"
+
+common_ids <- intersect(rownames(Xg_raw), clin$barcode)
+if (length(common_ids) < 30L) {
+  stop("Too few aligned samples between expression and clinical data: n = ", length(common_ids))
+}
+
+Xg_raw <- Xg_raw[common_ids, , drop = FALSE]
+clin_m <- clin[match(common_ids, clin$barcode), , drop = FALSE]
+stopifnot(all(rownames(Xg_raw) == clin_m$barcode))
+
+## ---------- Z-score genes and define survival object ----------
+Xg_z <- scale(Xg_raw)
+keep <- complete.cases(Xg_z) & complete.cases(clin_m[, c("OS.time", "OS.event")])
+Xg_z <- Xg_z[keep, , drop = FALSE]
+clin_m <- clin_m[keep, , drop = FALSE]
+
+if (nrow(Xg_z) < 30L) stop("Too few complete cases after expression/survival filtering: n = ", nrow(Xg_z))
+
+y_all <- survival::Surv(as.numeric(clin_m$OS.time), as.numeric(clin_m$OS.event))
+stopifnot(nrow(Xg_z) == nrow(clin_m))
+
+cat(sprintf("Aligned complete cases: n = %d | events = %d\n",
+            nrow(Xg_z), sum(as.numeric(clin_m$OS.event), na.rm = TRUE)),
+    file = log_file, append = TRUE)
+
+## ---------- Orient genes so that higher values indicate higher hazard ----------
+get_univariable_coef <- function(x) {
+  fit <- try(survival::coxph(y_all ~ x, ties = "efron"), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NA_real_)
+  as.numeric(coef(fit))
+}
+
+beta_univ <- vapply(as.data.frame(Xg_z), get_univariable_coef, numeric(1))
+sign_used <- ifelse(is.na(beta_univ), 1, ifelse(beta_univ >= 0, 1, -1))
+Xg_pos <- sweep(Xg_z, 2, sign_used, `*`)
+
+orientation_tbl <- tibble(
+  gene = colnames(Xg_z),
+  beta_univ = beta_univ,
+  sign_used = sign_used
+)
+readr::write_tsv(orientation_tbl, file.path(tab_dir, "Gene_signs_orientation.tsv"))
+
+## ---------- Clinical complete-case dataset ----------
+required_clin_cols <- c("age_years", "gender", "stage_use", "smoking_status")
+missing_clin_cols <- setdiff(required_clin_cols, names(clin_m))
+if (length(missing_clin_cols)) stop("Missing clinical columns: ", paste(missing_clin_cols, collapse = ", "))
+
+clin_design <- clin_m %>%
+  mutate(
+    age = as.numeric(age_years),
+    gender = factor(gender, levels = c("Female", "Male")),
+    stage = factor(stage_use, levels = c("I", "II", "III", "IV")),
+    smoking = factor(smoking_status, levels = c("Never", "Former", "Current"))
+  ) %>%
+  filter(!is.na(age), !is.na(gender), !is.na(stage), !is.na(smoking)) %>%
+  droplevels()
+
+common_design_ids <- intersect(rownames(Xg_pos), clin_design$barcode)
+Xg_pos <- Xg_pos[common_design_ids, , drop = FALSE]
+clin_design <- clin_design[match(common_design_ids, clin_design$barcode), , drop = FALSE]
+
+if (nrow(Xg_pos) < 30L) stop("Too few complete clinical cases for nomogram: n = ", nrow(Xg_pos))
+
+y_nom <- survival::Surv(as.numeric(clin_design$OS.time), as.numeric(clin_design$OS.event))
+stopifnot(nrow(Xg_pos) == nrow(clin_design))
+
+cat(sprintf("Nomogram complete cases: n = %d | events = %d\n",
+            nrow(Xg_pos), sum(as.numeric(clin_design$OS.event), na.rm = TRUE)),
+    file = log_file, append = TRUE)
+
+## ---------- Select top genes by univariable |z| ----------
+get_univariable_z <- function(x) {
+  z <- try(summary(survival::coxph(y_nom ~ x, ties = "efron"))$coef[1, "z"], silent = TRUE)
+  if (inherits(z, "try-error")) return(NA_real_)
+  as.numeric(z)
+}
+
+z_vec <- vapply(as.data.frame(Xg_pos), get_univariable_z, numeric(1))
+ord <- order(abs(z_vec), decreasing = TRUE, na.last = NA)
+ord <- ord[seq_len(min(TOP_K_GENES, length(ord)))]
+selected_genes <- colnames(Xg_pos)[ord]
+Xg_top <- Xg_pos[, selected_genes, drop = FALSE]
+
+sd_genes <- vapply(as.data.frame(Xg_top), function(v) sd(v, na.rm = TRUE), numeric(1))
+keep_genes <- is.finite(sd_genes) & sd_genes > 0
+if (!all(keep_genes)) {
+  dropped <- names(sd_genes)[!keep_genes]
+  cat("Dropped zero-variance genes: ", paste(dropped, collapse = ", "), "\n",
+      file = log_file, append = TRUE)
+  Xg_top <- Xg_top[, keep_genes, drop = FALSE]
+  selected_genes <- colnames(Xg_top)
+}
+if (ncol(Xg_top) < 2L) stop("Fewer than two genes remained for the gene-level nomogram.")
+
+selected_tbl <- tibble(
+  gene = selected_genes,
+  z_univariable = z_vec[selected_genes],
+  beta_univ = beta_univ[selected_genes],
+  sign_used = sign_used[selected_genes]
+)
+readr::write_tsv(selected_tbl, file.path(tab_dir, "Nomogram_byGENE_selected_genes.tsv"))
+
+## ---------- Final rms data ----------
+gene_safe_names <- safe_gene_name(selected_genes)
+gene_name_map <- tibble(original_gene = selected_genes, model_variable = gene_safe_names)
+readr::write_tsv(gene_name_map, file.path(tab_dir, "Nomogram_byGENE_gene_name_map.tsv"))
+
+Xg_top_df <- as.data.frame(Xg_top)
+colnames(Xg_top_df) <- gene_safe_names
+
+model_data <- cbind(
+  data.frame(
+    OS.time = as.numeric(clin_design$OS.time),
+    OS.event = as.numeric(clin_design$OS.event),
+    age = as.numeric(clin_design$age),
+    gender = droplevels(clin_design$gender),
+    stage = droplevels(clin_design$stage),
+    smoking = droplevels(clin_design$smoking),
+    row.names = clin_design$barcode,
+    check.names = FALSE
+  ),
+  Xg_top_df
+)
+
+for (g in gene_safe_names) model_data[[g]] <- as.numeric(model_data[[g]])
+
+## datadist must be created from the same data object used by rms::cph.
+dd <- rms::datadist(model_data)
+options(datadist = "dd")
+
+## ---------- Cox model and nomogram ----------
+rhs_terms <- c(gene_safe_names, "age", "gender", "stage", "smoking")
+formu <- as.formula(paste(
+  "Surv(OS.time, OS.event) ~",
+  paste(rhs_terms, collapse = " + ")
+))
+
+fit_nom <- rms::cph(formu, data = model_data, x = TRUE, y = TRUE,
+                    surv = TRUE, time.inc = max(NOMOGRAM_TIMES_DAYS))
+
+surv_fun <- rms::Survival(fit_nom)
+nom <- rms::nomogram(
+  fit_nom,
+  fun = lapply(NOMOGRAM_TIMES_DAYS, function(t) {
+    force(t)
+    function(lp) surv_fun(t, lp)
+  }),
+  funlabel = names(NOMOGRAM_TIMES_DAYS),
+  lp = TRUE
+)
+
+png(file.path(fig_dir, "FIG_nomogram_byGENE_POS.png"),
+    width = 11, height = 8, units = "in", res = 300)
+plot(nom, xfrac = 0.35, lmgp = 0.2)
+dev.off()
+
+## ---------- C-index and model object ----------
+c_index <- survival::concordance(
+  survival::Surv(OS.time, OS.event) ~ predict(fit_nom, type = "lp"),
+  data = model_data
+)$concordance
+
+readr::write_tsv(
+  tibble(Model = "Gene-level nomogram with hazard-oriented genes", C_index = c_index),
+  file.path(tab_dir, "Nomogram_byGENE_POS_Cindex.tsv")
+)
+
+saveRDS(
+  list(
+    fit = fit_nom,
+    selected_genes = selected_tbl,
+    gene_name_map = gene_name_map,
+    c_index = c_index,
+    model_data_n = nrow(model_data)
+  ),
+  file.path(mod_dir, "nomogram_by_gene_positive.rds")
+)
+
+cat(sprintf("Completed gene-level nomogram. C-index = %.3f | genes = %d\n",
+            c_index, length(selected_genes)),
+    file = log_file, append = TRUE)
+
+message(sprintf("Done: FIG_nomogram_byGENE_POS.png | C-index = %.3f | genes = %d",
+                c_index, length(selected_genes)))
