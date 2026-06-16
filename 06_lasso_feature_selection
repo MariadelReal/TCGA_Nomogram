@@ -1,0 +1,294 @@
+## 06_lasso_feature_selection.R
+## Purpose: fit a signature-only LASSO Cox model for TCGA-LUAD survival analysis.
+## Inputs:
+##   data/expr_tumor_SYMBOL_filtered.rds
+##   data/clin_survival_cohort.rds
+##   sig/CellCycle_LUAD_v1.csv  (required column: gene_symbol)
+## Outputs:
+##   tables/LASSO_signatureONLY_coefs.tsv
+##   tables/LASSO_signatureONLY_genes.tsv
+##   tables/LASSO_signatureONLY_LP.tsv
+##   tables/Forest_signatureONLY_refit.tsv
+##   figures/FIG_A_forest_signatureONLY.png
+##   figures/FIG_B_cv_curve_signatureONLY.png
+##   figures/FIG_C_coef_paths_signatureONLY.png
+##   figures/FIG_D_KM_signatureONLY_terciles.png  (only if survminer is installed)
+##   logs/06_lasso_feature_selection.txt
+
+rm(list = ls())
+set.seed(2025L)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(survival)
+  library(glmnet)
+  library(ggplot2)
+})
+
+# ---------- Paths ----------
+base_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+data_dir <- file.path(base_dir, "data")
+sig_dir  <- file.path(base_dir, "sig")
+fig_dir  <- file.path(base_dir, "figures")
+tab_dir  <- file.path(base_dir, "tables")
+log_dir  <- file.path(base_dir, "logs")
+
+invisible(lapply(c(fig_dir, tab_dir, log_dir), dir.create,
+                 recursive = TRUE, showWarnings = FALSE))
+
+log_file <- file.path(log_dir, "06_lasso_feature_selection.txt")
+cat("# 06_lasso_feature_selection\n", file = log_file)
+
+# ---------- Helpers ----------
+norm_bar <- function(x) {
+  x <- toupper(as.character(x))
+  gsub("[.]", "-", x)
+}
+
+pick_lambda_with_genes <- function(cvobj) {
+  nn <- function(s) Matrix::nnzero(coef(cvobj, s = s))
+
+  candidates <- c(
+    if (!is.null(cvobj$lambda.1se)) cvobj$lambda.1se else NULL,
+    cvobj$lambda.min
+  )
+
+  for (s in candidates) {
+    if (!is.null(s) && is.finite(s) && nn(s) > 0) return(s)
+  }
+
+  for (s in rev(cvobj$lambda)) {
+    if (is.finite(s) && nn(s) > 0) return(s)
+  }
+
+  NA_real_
+}
+
+# ---------- Load expression and clinical data ----------
+expr_path <- file.path(data_dir, "expr_tumor_SYMBOL_filtered.rds")
+clin_path <- file.path(data_dir, "clin_survival_cohort.rds")
+if (!file.exists(expr_path)) stop("Missing expression file: ", expr_path)
+if (!file.exists(clin_path)) stop("Missing clinical file: ", clin_path)
+
+expr <- readRDS(expr_path)  # first column = gene; remaining columns = barcodes
+clin <- readRDS(clin_path)  # includes OS.time, OS.event, barcode
+
+stopifnot("gene" %in% names(expr))
+stopifnot(all(c("OS.time", "OS.event", "barcode") %in% names(clin)))
+
+# ---------- Load gene signature ----------
+sig_file <- file.path(sig_dir, "CellCycle_LUAD_v1.csv")
+if (!file.exists(sig_file)) stop("Missing signature file: ", sig_file)
+
+sig <- readr::read_csv(sig_file, show_col_types = FALSE)
+colnames(sig) <- tolower(colnames(sig))
+stopifnot("gene_symbol" %in% names(sig))
+
+genes_signature <- unique(toupper(sig$gene_symbol))
+
+# ---------- Harmonize barcodes and genes ----------
+expr$gene <- toupper(expr$gene)
+
+bars_all <- setdiff(colnames(expr), "gene")
+colnames(expr)[match(bars_all, colnames(expr))] <- norm_bar(bars_all)
+
+present <- intersect(genes_signature, expr$gene)
+missing <- setdiff(genes_signature, present)
+
+cat(sprintf("Signature genes present: %d | missing: %d\n",
+            length(present), length(missing)),
+    file = log_file, append = TRUE)
+
+if (length(missing)) {
+  cat("Missing genes: ", paste(missing, collapse = ", "), "\n",
+      file = log_file, append = TRUE)
+}
+
+if (length(present) == 0) {
+  stop("No signature genes were found in the expression matrix.")
+}
+
+bars <- setdiff(colnames(expr), "gene")
+Xg_raw <- t(as.matrix(expr[match(present, expr$gene), bars, drop = FALSE]))
+colnames(Xg_raw) <- present
+rownames(Xg_raw) <- norm_bar(rownames(Xg_raw))
+
+clin$barcode <- norm_bar(clin$barcode)
+common_ids <- intersect(rownames(Xg_raw), clin$barcode)
+
+if (length(common_ids) < 30) {
+  stop("Too few common samples after expression-clinical alignment: ", length(common_ids),
+       ". Check barcode alignment.")
+}
+
+Xg_raw <- Xg_raw[common_ids, , drop = FALSE]
+clin_m <- clin[match(common_ids, clin$barcode), , drop = FALSE]
+stopifnot(all(rownames(Xg_raw) == clin_m$barcode))
+
+# ---------- Survival object and expression scaling ----------
+keep_surv <- complete.cases(clin_m[, c("OS.time", "OS.event")])
+Xg_raw <- Xg_raw[keep_surv, , drop = FALSE]
+clin_m <- clin_m[keep_surv, , drop = FALSE]
+
+Xg_z <- scale(Xg_raw)  # z-score per gene
+keep_x <- complete.cases(Xg_z)
+Xg_z <- Xg_z[keep_x, , drop = FALSE]
+clin_m <- clin_m[keep_x, , drop = FALSE]
+
+if (nrow(Xg_z) < 30) {
+  stop("Too few subjects after filtering complete expression/survival data: n = ", nrow(Xg_z))
+}
+
+y <- Surv(time = as.numeric(clin_m$OS.time),
+          event = as.numeric(clin_m$OS.event))
+
+n_events <- sum(as.numeric(clin_m$OS.event), na.rm = TRUE)
+cat(sprintf("N=%d | events=%d | genes=%d\n",
+            nrow(Xg_z), n_events, ncol(Xg_z)),
+    file = log_file, append = TRUE)
+
+# ---------- Signature-only LASSO Cox model ----------
+cv_sig <- cv.glmnet(
+  x = Xg_z,
+  y = y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10,
+  lambda.min.ratio = 1e-4
+)
+
+use_lambda <- pick_lambda_with_genes(cv_sig)
+if (!is.finite(use_lambda)) {
+  stop("No lambda produced active genes. Consider testing alpha < 1 in a separate sensitivity analysis.")
+}
+
+cat(sprintf("Selected lambda: %.6g\n", use_lambda), file = log_file, append = TRUE)
+cat(sprintf("lambda.min: %.6g | lambda.1se: %.6g\n",
+            cv_sig$lambda.min,
+            if (!is.null(cv_sig$lambda.1se)) cv_sig$lambda.1se else NA_real_),
+    file = log_file, append = TRUE)
+
+# ---------- Non-zero coefficients ----------
+coef_mat <- as.matrix(coef(cv_sig, s = use_lambda))
+tbl_sel <- tibble(
+  variable = rownames(coef_mat),
+  beta = as.numeric(coef_mat[, 1])
+) %>%
+  filter(beta != 0)
+
+readr::write_tsv(tbl_sel, file.path(tab_dir, "LASSO_signatureONLY_coefs.tsv"))
+readr::write_tsv(tibble(gene = tbl_sel$variable), file.path(tab_dir, "LASSO_signatureONLY_genes.tsv"))
+
+cat(sprintf("Active genes (%d): %s\n",
+            nrow(tbl_sel), paste(tbl_sel$variable, collapse = ", ")),
+    file = log_file, append = TRUE)
+
+# Linear predictor for downstream KM/nomogram/reporting
+lp_sig <- as.numeric(predict(cv_sig, newx = Xg_z, s = use_lambda, type = "link"))
+
+out_sig <- tibble(
+  sample_id = rownames(Xg_z),
+  OS.time = as.numeric(clin_m$OS.time),
+  OS.event = as.numeric(clin_m$OS.event),
+  LP_LASSO_signatureONLY = lp_sig
+)
+
+readr::write_tsv(out_sig, file.path(tab_dir, "LASSO_signatureONLY_LP.tsv"))
+
+# Save model object for audit/reuse
+saveRDS(cv_sig, file.path(data_dir, "lasso_signatureONLY_cv_fit.rds"))
+
+# ---------- Figures ----------
+png(file.path(fig_dir, "FIG_B_cv_curve_signatureONLY.png"),
+    width = 1800, height = 1500, res = 200)
+par(mar = c(5, 5, 3, 2))
+plot(cv_sig, main = "B. CV deviance (signature only)")
+dev.off()
+
+png(file.path(fig_dir, "FIG_C_coef_paths_signatureONLY.png"),
+    width = 1800, height = 1500, res = 200)
+par(mar = c(5, 5, 3, 2))
+plot(cv_sig$glmnet.fit, xvar = "lambda", label = FALSE,
+     main = "C. Coefficient paths (signature only)")
+abline(v = log(cv_sig$lambda.min), lty = 2)
+if (!is.null(cv_sig$lambda.1se)) abline(v = log(cv_sig$lambda.1se), lty = 2)
+legend("topright", bty = "n", legend = c("lambda.min", "lambda.1se"), lty = 2, cex = 0.9)
+dev.off()
+
+# Classical Cox refit for selected genes, used only for visualization/reporting.
+if (nrow(tbl_sel) > 0) {
+  genes_sel <- tbl_sel$variable
+  X_use <- as.data.frame(Xg_z[, genes_sel, drop = FALSE])
+
+  original_names <- colnames(X_use)
+  safe_names <- make.names(original_names, unique = TRUE)
+  colnames(X_use) <- safe_names
+  name_map <- setNames(original_names, safe_names)
+
+  y_ref <- y
+  fit_refit <- coxph(
+    as.formula(paste("y_ref ~", paste(safe_names, collapse = " + "))),
+    data = X_use,
+    ties = "efron"
+  )
+
+  sfit <- summary(fit_refit)
+
+  forest_df <- tibble(
+    Gene = unname(name_map[rownames(sfit$coef)]),
+    Coefficient = as.numeric(sfit$coef[, "coef"]),
+    HR = as.numeric(sfit$coef[, "exp(coef)"]),
+    lower95 = as.numeric(sfit$conf.int[, "lower .95"]),
+    upper95 = as.numeric(sfit$conf.int[, "upper .95"]),
+    Pvalue = as.numeric(sfit$coef[, "Pr(>|z|)"])
+  ) %>%
+    arrange(desc(HR))
+
+  readr::write_tsv(forest_df, file.path(tab_dir, "Forest_signatureONLY_refit.tsv"))
+
+  p_forest <- ggplot(forest_df, aes(y = reorder(Gene, HR), x = HR)) +
+    geom_point(size = 2.4) +
+    geom_errorbarh(aes(xmin = lower95, xmax = upper95), height = 0, linewidth = 0.7) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    scale_x_continuous(trans = "log10") +
+    labs(x = "Hazard Ratio (log10)", y = NULL,
+         title = "A. Cox refit (signature only)") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
+
+  ggsave(file.path(fig_dir, "FIG_A_forest_signatureONLY.png"),
+         p_forest, width = 7.5, height = 6.0, dpi = 300)
+} else {
+  cat("No active genes selected; forest plot was not generated.\n",
+      file = log_file, append = TRUE)
+}
+
+# Optional KM by LP tertiles if survminer is installed.
+if ("survminer" %in% rownames(installed.packages())) {
+  suppressPackageStartupMessages(library(survminer))
+
+  df_km <- out_sig %>%
+    mutate(tercile = dplyr::ntile(LP_LASSO_signatureONLY, 3))
+
+  fit_km <- survfit(Surv(OS.time, OS.event) ~ tercile, data = df_km)
+
+  g <- survminer::ggsurvplot(
+    fit_km,
+    data = df_km,
+    risk.table = FALSE,
+    legend.labs = c("Low", "Medium", "High"),
+    legend.title = "LP tertiles"
+  )
+
+  ggplot2::ggsave(file.path(fig_dir, "FIG_D_KM_signatureONLY_terciles.png"),
+                  g$plot, width = 6, height = 5, dpi = 300)
+} else {
+  cat("Package 'survminer' not installed; KM tertile plot skipped.\n",
+      file = log_file, append = TRUE)
+}
+
+cat("[OK] 06_lasso_feature_selection completed.\n", file = log_file, append = TRUE)
+message("Done. Check tables/, figures/, data/, and logs/.")
